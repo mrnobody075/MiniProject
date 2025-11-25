@@ -1,18 +1,27 @@
 import sys
+import os
 import cv2
 import numpy as np
 import face_recognition
-import os
 from datetime import datetime
 import sqlite3
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QPushButton, QVBoxLayout,
-                             QHBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-                             QGroupBox)
+
+from ultralytics import YOLO
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QLabel, QPushButton, QVBoxLayout,
+    QHBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QHeaderView,
+    QGroupBox
+)
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QImage, QPixmap
 
-# Ensure SQLite database and table exist
-conn = sqlite3.connect('C:/Users/vishal/PycharmProjects/MiniProject/employee.db')
+# ==========================
+# DATABASE SETUP
+# ==========================
+# Change this if your DB path is different
+DB_PATH = r"C:/Users/vishal/PycharmProjects/MiniProject/employee.db"
+
+conn = sqlite3.connect(DB_PATH)
 cursor = conn.cursor()
 cursor.execute('''CREATE TABLE IF NOT EXISTS attendance (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -21,34 +30,49 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS attendance (
                  )''')
 conn.commit()
 
-def findEncodings(images):
-    encodeList = []
-    for img in images:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        encode = face_recognition.face_encodings(img)[0]
-        encodeList.append(encode)
-    return encodeList
+
+# ==========================
+# HELPER FUNCTIONS
+# ==========================
+
 
 def markAttendance(name):
-    cursor.execute("SELECT * FROM attendance WHERE name = ? AND date(time) = date('now')", (name,))
+    cursor.execute(
+        "SELECT * FROM attendance WHERE name = ? AND date(time) = date('now')",
+        (name,),
+    )
     record = cursor.fetchone()
     if record is None:
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        cursor.execute("INSERT INTO attendance (name, time) VALUES (?, ?)", (name, now))
+        cursor.execute(
+            "INSERT INTO attendance (name, time) VALUES (?, ?)",
+            (name, now),
+        )
         conn.commit()
-        return True  # Indicates new attendance was marked
-    return False  # Attendance already marked for today
+        return True
+    return False
+
 
 def loadImages(path):
     images = []
     classNames = []
-    myList = os.listdir(path)
-    for cl in myList:
-        curImg = cv2.imread(f'{path}/{cl}')
-        images.append(curImg)
+    if not os.path.isdir(path):
+        print(f"[WARN] Images folder '{path}' not found.")
+        return images, classNames
+
+    for cl in os.listdir(path):
+        cur_path = os.path.join(path, cl)
+        img = cv2.imread(cur_path)
+        if img is None:
+            continue
+        images.append(img)
         classNames.append(os.path.splitext(cl)[0])
     return images, classNames
 
+
+# ==========================
+# MAIN APPLICATION
+# ==========================
 class AttendanceSystem(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -59,11 +83,33 @@ class AttendanceSystem(QMainWindow):
         self.timer.timeout.connect(self.updateFrame)
         self.cap = cv2.VideoCapture(0)
 
-        self.knownFaces = {}
+        # ---- YOLO helmet model ----
+        # Change this to where you saved hemletYoloV8_100epochs.pt
+        model_path = r"hemletYoloV8_100epochs.pt"
+        self.helmet_model = YOLO(model_path)
+        print("Helmet model classes:", self.helmet_model.names)
+
+        # auto-detect helmet class ids (class names containing 'helmet')
+        self.HELMET_CLASS_IDS = [
+            i for i, n in self.helmet_model.names.items()
+            if "helmet" in str(n).lower()
+        ]
+        if not self.HELMET_CLASS_IDS:
+            # fallback: treat all classes as helmet
+            self.HELMET_CLASS_IDS = list(self.helmet_model.names.keys())
+        print("Using helmet class ids:", self.HELMET_CLASS_IDS)
+
+        self.encodeListKnown = []
+        self.classNames = []
+        self.knownFaces = {}  # to avoid double marking per session
         self.totalCount = 0
+
         self.initUI()
         self.startRecognition()
 
+    # --------------------------
+    # UI SETUP
+    # --------------------------
     def initUI(self):
         centralWidget = QWidget(self)
         self.setCentralWidget(centralWidget)
@@ -71,27 +117,37 @@ class AttendanceSystem(QMainWindow):
 
         titleLabel = QLabel("Worker Attendance System", self)
         titleLabel.setAlignment(Qt.AlignCenter)
-        titleLabel.setStyleSheet("font-size: 28px; font-weight: bold; margin: 20px 0; color: #343a40;")
+        titleLabel.setStyleSheet(
+            "font-size: 28px; font-weight: bold; margin: 20px 0; color: #343a40;"
+        )
         layout.addWidget(titleLabel)
 
         mainLayout = QHBoxLayout()
         layout.addLayout(mainLayout)
 
+        # Left panel
         leftPanel = QVBoxLayout()
         mainLayout.addLayout(leftPanel, 1)
 
         self.startButton = QPushButton("Start Recognition", self)
-        self.startButton.setStyleSheet("font-size: 18px; padding: 10px; background-color: #007bff; color: white;")
+        self.startButton.setStyleSheet(
+            "font-size: 18px; padding: 10px; background-color: #007bff; color: white;"
+        )
         self.startButton.clicked.connect(self.startRecognition)
         leftPanel.addWidget(self.startButton)
 
         self.quitButton = QPushButton("Quit", self)
-        self.quitButton.setStyleSheet("font-size: 18px; padding: 10px; background-color: #dc3545; color: white;")
+        self.quitButton.setStyleSheet(
+            "font-size: 18px; padding: 10px; background-color: #dc3545; color: white;"
+        )
         self.quitButton.clicked.connect(self.closeApp)
         leftPanel.addWidget(self.quitButton)
 
         tableGroupBox = QGroupBox("Attendance Table")
-        tableGroupBox.setStyleSheet("font-size: 18px; font-weight: bold; margin-top: 20px; color: #343a40; padding: 10px; padding-bottom: 5px;")
+        tableGroupBox.setStyleSheet(
+            "font-size: 18px; font-weight: bold; margin-top: 20px; "
+            "color: #343a40; padding: 10px; padding-bottom: 5px;"
+        )
         leftPanel.addWidget(tableGroupBox)
 
         tableLayout = QVBoxLayout(tableGroupBox)
@@ -104,9 +160,12 @@ class AttendanceSystem(QMainWindow):
 
         self.totalCountLabel = QLabel("Total Workers Recognized: 0", self)
         self.totalCountLabel.setAlignment(Qt.AlignCenter)
-        self.totalCountLabel.setStyleSheet("font-size: 18px; font-weight: bold; color: #28a745; margin-top: 10px;")
+        self.totalCountLabel.setStyleSheet(
+            "font-size: 18px; font-weight: bold; color: #28a745; margin-top: 10px;"
+        )
         leftPanel.addWidget(self.totalCountLabel)
 
+        # Right panel
         rightPanel = QVBoxLayout()
         mainLayout.addLayout(rightPanel, 3)
 
@@ -118,69 +177,184 @@ class AttendanceSystem(QMainWindow):
         self.imageLabel.setAlignment(Qt.AlignCenter)
         webcamLayout.addWidget(self.imageLabel)
 
+    # --------------------------
+    # LOGIC
+    # --------------------------
     def startRecognition(self):
         path = "images"
         images, classNames = loadImages(path)
-        self.encodeListKnown = findEncodings(images)
-        self.classNames = classNames
+
+        self.encodeListKnown = []
+        self.classNames = []
         self.knownFaces.clear()
         self.totalCount = 0
-        self.updateAttendanceTableFromDB()  # Ensure table is reset to match the database
+
+        for img, name in zip(images, classNames):
+            if img is None:
+                print(f"[WARN] Could not read image for {name}")
+                continue
+
+            rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            encodes = face_recognition.face_encodings(rgb_img)
+            if len(encodes) == 0:
+                print(f"[WARN] No face found in image for {name}, skipping")
+                continue
+
+            self.encodeListKnown.append(encodes[0])
+            self.classNames.append(name)
+            print(f"[INFO] Registered person: {name}")
+
+        print(f"[INFO] Total registered people: {len(self.classNames)}")
+
+        self.updateAttendanceTableFromDB()
         self.totalCountLabel.setText("Total Workers Recognized: 0")
         self.timer.start(30)
+
+    def has_helmet_for_face(self, face_box, helmet_boxes):
+        """
+        face_box: (x1, y1, x2, y2) in full-res frame coordinates
+        helmet_boxes: list of (hx1, hy1, hx2, hy2)
+        """
+        x1, y1, x2, y2 = face_box
+
+        for hx1, hy1, hx2, hy2 in helmet_boxes:
+            # horizontal overlap
+            horizontal_overlap = not (hx2 < x1 or hx1 > x2)
+            # helmet bounding box should intersect near top of face
+            vertical_condition = (hy2 > y1) and (hy1 < y1)
+            if horizontal_overlap and vertical_condition:
+                return True
+        return False
+
     def updateFrame(self):
         ret, frame = self.cap.read()
         if not ret:
             return
 
-        imgS = cv2.resize(frame, (0, 0), None, 0.25, 0.25)
-        imgS = cv2.cvtColor(imgS, cv2.COLOR_BGR2RGB)
+        # --------------------------
+        # 1) HELMET DETECTION (YOLO)
+        # --------------------------
+        helmet_boxes = []
+        try:
+            results = self.helmet_model(frame, conf=0.5, verbose=False)
+            for r in results:
+                if r.boxes is None:
+                    continue
+                for box in r.boxes:
+                    cls_id = int(box.cls[0])
+                    if cls_id in self.HELMET_CLASS_IDS:
+                        x1, y1, x2, y2 = box.xyxy[0].tolist()
+                        helmet_boxes.append(
+                            (int(x1), int(y1), int(x2), int(y2))
+                        )
+        except Exception as e:
+            print("Helmet detection error:", e)
 
-        facesCurFrame = face_recognition.face_locations(imgS)
-        encodesCurFrame = face_recognition.face_encodings(imgS, facesCurFrame)
+        # --------------------------
+        # 2) FACE RECOGNITION
+        # --------------------------
+        small_frame = cv2.resize(frame, (0, 0), None, 0.25, 0.25)
+        rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+
+        facesCurFrame = face_recognition.face_locations(rgb_small_frame)
+        encodesCurFrame = face_recognition.face_encodings(
+            rgb_small_frame, facesCurFrame
+        )
 
         for encodeFace, faceLoc in zip(encodesCurFrame, facesCurFrame):
-            matches = face_recognition.compare_faces(self.encodeListKnown, encodeFace, tolerance=0.5)
-            faceDis = face_recognition.face_distance(self.encodeListKnown, encodeFace)
+            if not self.encodeListKnown:
+                continue
+
+            matches = face_recognition.compare_faces(
+                self.encodeListKnown, encodeFace, tolerance=0.5
+            )
+            faceDis = face_recognition.face_distance(
+                self.encodeListKnown, encodeFace
+            )
             best_match_index = np.argmin(faceDis)
 
-            def updateAttendanceTableFromDB(self):
-                """Load all attendance records from the database and update the table."""
-                self.tableWidget.setRowCount(0)  # Clear existing rows
-                cursor.execute("SELECT Name, Time FROM attendance ORDER BY Name")
-                rows = cursor.fetchall()
-                for name, time in rows:
-                    rowPosition = self.tableWidget.rowCount()
-                    self.tableWidget.insertRow(rowPosition)
-                    self.tableWidget.setItem(rowPosition, 0, QTableWidgetItem(name))
-                    self.tableWidget.setItem(rowPosition, 1, QTableWidgetItem(time))
-                self.totalCount = len(rows)
-                self.totalCountLabel.setText(f"Total Workers Recognized: {self.totalCount}")
+            name = "Unrecognized"
+            has_helmet = False
 
-            # Update logic in updateFrame:
+            # scale back to original frame
+            top, right, bottom, left = faceLoc
+            top *= 4
+            right *= 4
+            bottom *= 4
+            left *= 4
+
+            face_box = (left, top, right, bottom)
+
             if matches[best_match_index]:
-                name = self.classNames[best_match_index].upper()
-                if name not in self.knownFaces:
-                    marked = markAttendance(name)
-                    if marked:
-                        self.totalCount += 1
-                        self.totalCountLabel.setText(f"Total Workers Recognized: {self.totalCount}")
-                        self.updateAttendanceTable(name)
-                    self.knownFaces[name] = True
+                has_helmet = self.has_helmet_for_face(face_box, helmet_boxes)
+
+                if has_helmet:
+                    if best_match_index < len(self.classNames):
+                        name = self.classNames[best_match_index].upper()
+                    else:
+                        name = "UNKNOWN"
+
+                    # Only mark attendance when helmet is on
+                    if name not in self.knownFaces and name not in ["UNKNOWN"]:
+                        marked = markAttendance(name)
+                        if marked:
+                            self.totalCount += 1
+                            self.totalCountLabel.setText(
+                                f"Total Workers Recognized: {self.totalCount}"
+                            )
+                            self.updateAttendanceTable(name)
+                        self.knownFaces[name] = True
+
+            # Draw face box + label
+            if name == "Unrecognized" or not has_helmet:
+                color = (0, 0, 255)  # red
+                label = "NO HELMET" if name != "Unrecognized" else name
             else:
-                name = "Unrecognized"
+                color = (0, 255, 0)  # green
+                label = name
 
-            y1, x2, y2, x1 = faceLoc
-            y1, x2, y2, x1 = y1 * 4, x2 * 4, y2 * 4, x1 * 4
-            color = (0, 255, 0) if name != "Unrecognized" else (0, 0, 255)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, name, (x1 + 6, y2 - 6), cv2.FONT_HERSHEY_COMPLEX, 1, (255, 255, 255), 2)
+            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+            cv2.putText(
+                frame,
+                label,
+                (left + 6, bottom - 6),
+                cv2.FONT_HERSHEY_COMPLEX,
+                1,
+                (255, 255, 255),
+                2,
+            )
 
-        img = QImage(frame.data, frame.shape[1], frame.shape[0], QImage.Format_BGR888)
+        # --------------------------
+        # 3) OPTIONAL: DRAW HELMET BOXES FOR DEBUG
+        # --------------------------
+        for (hx1, hy1, hx2, hy2) in helmet_boxes:
+            cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), (255, 255, 0), 2)
+            cv2.putText(
+                frame,
+                "Helmet",
+                (hx1, hy1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 0),
+                2,
+            )
+
+        # --------------------------
+        # 4) SHOW IN QT LABEL
+        # --------------------------
+        img = QImage(
+            frame.data,
+            frame.shape[1],
+            frame.shape[0],
+            frame.strides[0],
+            QImage.Format_BGR888,
+        )
         self.imageLabel.setPixmap(QPixmap.fromImage(img))
 
+    # --------------------------
+    # ATTENDANCE TABLE
+    # --------------------------
     def updateAttendanceTable(self, name):
-        """Update the GUI table with the latest recognized worker."""
         now = datetime.now().strftime('%H:%M:%S')
         rowPosition = self.tableWidget.rowCount()
         self.tableWidget.insertRow(rowPosition)
@@ -188,9 +362,8 @@ class AttendanceSystem(QMainWindow):
         self.tableWidget.setItem(rowPosition, 1, QTableWidgetItem(now))
 
     def updateAttendanceTableFromDB(self):
-        """Load all attendance records from the database and update the table."""
-        self.tableWidget.setRowCount(0)  # Clear existing rows
-        cursor.execute("SELECT Name, Time FROM attendance ORDER BY Name")
+        self.tableWidget.setRowCount(0)
+        cursor.execute("SELECT name, time FROM attendance ORDER BY name")
         rows = cursor.fetchall()
         for name, time in rows:
             rowPosition = self.tableWidget.rowCount()
@@ -198,8 +371,13 @@ class AttendanceSystem(QMainWindow):
             self.tableWidget.setItem(rowPosition, 0, QTableWidgetItem(name))
             self.tableWidget.setItem(rowPosition, 1, QTableWidgetItem(time))
         self.totalCount = len(rows)
-        self.totalCountLabel.setText(f"Total Workers Recognized: {self.totalCount}")
+        self.totalCountLabel.setText(
+            f"Total Workers Recognized: {self.totalCount}"
+        )
 
+    # --------------------------
+    # CLEANUP
+    # --------------------------
     def closeApp(self):
         self.timer.stop()
         self.cap.release()
@@ -207,7 +385,9 @@ class AttendanceSystem(QMainWindow):
         conn.close()
         self.close()
 
-app = QApplication(sys.argv)
-window = AttendanceSystem()
-window.show()
-sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = AttendanceSystem()
+    window.show()
+    sys.exit(app.exec_())
